@@ -1498,6 +1498,8 @@ public class ResidentServer : IDisposable
         var limit = req.GetIntArg("limit");
         var cols = req.GetCols("cols");
         var pageFilter = req.GetArgOrNull("page");
+        var assetsDir = req.GetArgOrNull("assets");
+        var assetsUrl = req.GetArgOrNull("assets-url");
 
         if (mode!.ToLowerInvariant() is "html" or "h")
         {
@@ -1513,7 +1515,8 @@ public class ResidentServer : IDisposable
                 html = CommandBuilder.RenderViaRegistry(_handler, "xlsx", new OfficeCli.Core.Rendering.RenderOptions());
             else if (_handler is OfficeCli.Handlers.WordHandler)
                 html = CommandBuilder.RenderViaRegistry(_handler, "docx",
-                    new OfficeCli.Core.Rendering.RenderOptions { PageFilter = pageFilter });
+                    new OfficeCli.Core.Rendering.RenderOptions
+                    { PageFilter = pageFilter, AssetDirectory = assetsDir, AssetUrlPrefix = assetsUrl });
             else if (_handler is OfficeCli.Core.Plugins.FormatHandlerProxy proxy)
                 html = proxy.ViewAsHtml(int.TryParse(pageFilter, out var pp) ? pp : (int?)null);
 

@@ -3,6 +3,7 @@
 
 using System.Text;
 using DocumentFormat.OpenXml.Packaging;
+using OfficeCli.Core.Rendering;
 
 namespace OfficeCli.Core;
 
@@ -30,10 +31,11 @@ internal static class HtmlPreviewHelper
     }
 
     /// <summary>
-    /// Load an OpenXML part by its relationship ID and return the content as a base64 data URI.
-    /// Returns null if the part cannot be found or read.
+    /// Load an OpenXML part by its relationship ID and return the URI to reference it by:
+    /// a base64 data URI, or — when <paramref name="assets"/> is set — the URL of the file
+    /// the part was written to. Returns null if the part cannot be found or read.
     /// </summary>
-    public static string? PartToDataUri(OpenXmlPart parentPart, string relId)
+    public static string? PartToDataUri(OpenXmlPart parentPart, string relId, ImageAssetSink? assets = null)
     {
         try
         {
@@ -50,9 +52,20 @@ internal static class HtmlPreviewHelper
                 // available (the project deliberately avoids System.Drawing/GDI). Degrade
                 // gracefully to a self-contained SVG placeholder so the preview shows a
                 // clean framed box instead of a broken-image icon.
+                // Stays inline even when assets are externalized: it is generated here, not
+                // a part, so there is no file behind it to point a URL at — and at a few
+                // hundred bytes the inline cost is irrelevant next to a real screenshot.
                 return PlaceholderDataUri(undecodableLabel);
             }
-            return $"data:{contentType};base64,{Convert.ToBase64String(ms.ToArray())}";
+            var bytes = ms.ToArray();
+            if (assets != null)
+            {
+                // Null means the write failed (read-only directory, disk full) — fall
+                // through to inlining, the same graceful degradation as the catch below.
+                var url = assets.TryWrite(bytes, contentType);
+                if (url != null) return url;
+            }
+            return $"data:{contentType};base64,{Convert.ToBase64String(bytes)}";
         }
         catch
         {

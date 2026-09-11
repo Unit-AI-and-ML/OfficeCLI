@@ -41,6 +41,13 @@ public partial class WordHandler
         // null → fall back to MainDocumentPart (body path).
         public DocumentFormat.OpenXml.Packaging.OpenXmlPart? ImageHostPart { get; set; }
 
+        // Where image parts are written when the request asked for external assets
+        // (--assets). null → every image inlines as a base64 data URI, as before.
+        // Lives on the context rather than a parameter for the same reason
+        // ImageHostPart does: every render method already reaches the context, and an
+        // image can be emitted from anywhere in the document (body, header, footnote).
+        public OfficeCli.Core.Rendering.ImageAssetSink? ImageAssets { get; set; }
+
         // Table-style run properties (base rPr + matching conditional-format
         // rPr) for the cell currently being rendered, ordered lowest→highest
         // priority. Per ECMA-376 §17.7.2 the run-property cascade is:
@@ -122,12 +129,18 @@ public partial class WordHandler
     /// <param name="gridCellWpx">Exact thumbnail cell width in CSS px. The CLI
     /// computes this from the viewport width and column count so the C# height
     /// math and the in-browser layout agree exactly.</param>
-    public string ViewAsHtml(string? pageFilter = null, int gridCols = 0, int gridCellWpx = 0)
+    /// <param name="assetDirectory">Directory to write image parts into, referenced by
+    /// URL instead of inlined as base64 (see <see cref="Core.Rendering.RenderOptions.AssetDirectory"/>).
+    /// Null = inline. An unwritable directory degrades to inlining rather than failing.</param>
+    /// <param name="assetUrlPrefix">URL prefix for those files. Null = the directory's
+    /// own name.</param>
+    public string ViewAsHtml(string? pageFilter = null, int gridCols = 0, int gridCellWpx = 0,
+        string? assetDirectory = null, string? assetUrlPrefix = null)
     {
         using var _cul = InvariantCultureScope.Enter();
         try
         {
-            return ViewAsHtmlCore(pageFilter, gridCols, gridCellWpx);
+            return ViewAsHtmlCore(pageFilter, gridCols, gridCellWpx, assetDirectory, assetUrlPrefix);
         }
         catch (System.Xml.XmlException)
         {
@@ -140,9 +153,11 @@ public partial class WordHandler
         }
     }
 
-    private string ViewAsHtmlCore(string? pageFilter, int gridCols = 0, int gridCellWpx = 0)
+    private string ViewAsHtmlCore(string? pageFilter, int gridCols = 0, int gridCellWpx = 0,
+        string? assetDirectory = null, string? assetUrlPrefix = null)
     {
-        _ctx = new HtmlRenderContext();
+        _ctx = new HtmlRenderContext
+        { ImageAssets = Core.Rendering.ImageAssetSink.For(assetDirectory, assetUrlPrefix) };
         ResolveThemeCjkFont();
         // Malformed docx (e.g. <!DOCTYPE> prolog, bogus encoding= attribute
         // on the XML declaration) makes accessing the lazily-parsed Document

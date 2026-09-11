@@ -46,4 +46,15 @@ public sealed class RenderOptions
 
     /// <summary>Target raster height in px for Png/Pdf output. 0 = renderer default.</summary>
     public int RasterHeightPx { get; init; }
+
+    /// <summary>Directory to write image parts into as standalone files, referenced from
+    /// the HTML by URL, instead of inlining them as base64 data URIs. Null = inline (the
+    /// default, and the only behavior when this is unset). Files are content-addressed, so
+    /// an image used twice is written once. Created if missing.</summary>
+    public string? AssetDirectory { get; init; }
+
+    /// <summary>URL prefix for the files written under <see cref="AssetDirectory"/>, e.g.
+    /// "/static/img". Null = the directory's own name. Never the filesystem path: the HTML
+    /// is served by an HTTP server that mounts the directory wherever it likes.</summary>
+    public string? AssetUrlPrefix { get; init; }
 }
