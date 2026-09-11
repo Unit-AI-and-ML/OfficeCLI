@@ -439,6 +439,111 @@ public partial class WordHandler
     }
 
     /// <summary>
+    /// True when this drawing is a wrapNone IMAGE that
+    /// RenderWrapNoneOverlayImage positions against its own anchor paragraph
+    /// instead of the .page box: a floating image whose vertical origin is the
+    /// paragraph/line and which carries an explicit posOffset (the offset is
+    /// then emitted verbatim as `top`, so the host paragraph must be its
+    /// containing block) and whose horizontal origin is column-relative (Word's
+    /// text column, which the host's own left edge tracks once the host's left
+    /// inset is subtracted).
+    ///
+    /// Page-relative horizontals are excluded: their left coordinate is measured
+    /// from the physical page edge, which the host paragraph — inset by its own
+    /// margin/list gutter — cannot express, so they stay on the page-relative
+    /// path. Floats with a &lt;wp:align&gt; but no posOffset are excluded too:
+    /// the overlay path ignores vAlign entirely, and re-anchoring them to a
+    /// paragraph would silently change where they paint.
+    /// </summary>
+    private static bool IsParagraphRelativeWrapNoneFloat(Drawing drawing)
+    {
+        var anchor = drawing.Descendants<DW.Anchor>().FirstOrDefault();
+        if (anchor == null) return false;
+        if (!anchor.Elements().Any(e => e.LocalName == "wrapNone")) return false;
+        // RenderDrawingHtml routes shapes, groups and charts to their own
+        // renderers before the image path; those shapes already have a
+        // paragraph-relative path of their own (ComputeParagraphAnchorAbsoluteCss).
+        if (drawing.Descendants().Any(e => e.LocalName == "wsp")) return false;
+        // RenderImageHtml bails out without an embedded image, and a chart
+        // graphic carries no blip — neither reaches the overlay path.
+        if (drawing.Descendants<A.Blip>().FirstOrDefault()?.Embed?.Value == null) return false;
+
+        var vPos = anchor.GetFirstChild<DW.VerticalPosition>();
+        if (vPos == null || !IsParagraphTopRelative(vPos.RelativeFrom?.Value)) return false;
+        if (vPos.Descendants().FirstOrDefault(e => e.LocalName == "posOffset") is not { } vOff
+            || !long.TryParse(vOff.InnerText, out _))
+            return false;
+
+        var hPos = anchor.GetFirstChild<DW.HorizontalPosition>();
+        var hFrom = hPos?.RelativeFrom?.Value;
+        return IsColumnLeftRelative(hFrom) || IsColumnSpanRelative(hFrom);
+    }
+
+    /// <summary>
+    /// True when the paragraph anchors at least one wrapNone float that
+    /// IsParagraphRelativeWrapNoneFloat re-anchors to the paragraph. Drives the
+    /// position:relative containing block on the body host (the &lt;p&gt;/&lt;div&gt;
+    /// paragraph tag, or the &lt;li&gt; tag a list item renders as) so the
+    /// absolute `top`/`left` resolve against the anchor paragraph rather than the
+    /// .page box.
+    /// </summary>
+    private bool ParagraphAnchorsParagraphRelativeWrapNoneImage(Paragraph para)
+    {
+        var floats = 0;
+        foreach (var drawing in para.Descendants<Drawing>())
+        {
+            // A full-page image paints a width/height:100% page background
+            // (RenderImageHtml's IsFullPageSize branch, taken before the anchor
+            // dispatch) and is emitted INLINE inside this paragraph — unlike the
+            // full-page SHAPE path, which hoists its fill to page start. Handing
+            // the paragraph a containing block would collapse that cover onto the
+            // paragraph box (one of the defects ParagraphAnchorsSubParagraphShape
+            // documents), so such a paragraph keeps the .page-relative path
+            // entirely and its floats paint exactly as before.
+            if (IsFullPageImage(drawing)) return false;
+            if (IsParagraphRelativeWrapNoneFloat(drawing)) floats++;
+        }
+        return floats > 0;
+    }
+
+    /// <summary>
+    /// True for a full-page-size picture — the shape RenderImageHtml paints as a
+    /// width/height:100% page background.
+    /// </summary>
+    private bool IsFullPageImage(Drawing drawing)
+    {
+        if (drawing.Descendants<A.Blip>().FirstOrDefault()?.Embed?.Value == null) return false;
+        var extent = drawing.Descendants<DW.Extent>().FirstOrDefault();
+        return extent != null && IsFullPageSize(extent.Cx?.Value ?? 0, extent.Cy?.Value ?? 0);
+    }
+
+    /// <summary>
+    /// Render a paragraph's content with the paragraph registered as the
+    /// containing block for its paragraph-relative wrapNone floats, so
+    /// RenderWrapNoneOverlayImage can measure them from the host's own top-left
+    /// (and subtract hostInsetPt from the column-relative horizontal offset).
+    /// The registration is matched by paragraph identity, so a float rendered
+    /// from a nested container (text box, footnote) never picks up an outer
+    /// paragraph's inset.
+    /// </summary>
+    private void RenderParagraphContentAsFloatHost(StringBuilder sb, Paragraph para, double hostInsetPt)
+    {
+        var savedHost = _ctx.OverlayHostParagraph;
+        var savedInset = _ctx.OverlayHostInsetPt;
+        _ctx.OverlayHostParagraph = para;
+        _ctx.OverlayHostInsetPt = hostInsetPt;
+        try
+        {
+            RenderParagraphContentHtml(sb, para);
+        }
+        finally
+        {
+            _ctx.OverlayHostParagraph = savedHost;
+            _ctx.OverlayHostInsetPt = savedInset;
+        }
+    }
+
+    /// <summary>
     /// Render a wrapNone anchored image as an absolutely-positioned overlay so
     /// the body text flows independently of it. behindDoc="1" paints the image
     /// behind the text (negative z-index, watermark-style); behindDoc="0" paints
@@ -464,6 +569,27 @@ public partial class WordHandler
         // into the body area. When hosted in a header/footer, measure
         // column/paragraph offsets from the band origin (0,0) instead.
         bool inHeaderFooter = _ctx.ImageHostPart is HeaderPart or FooterPart;
+
+        // A paragraph/line-relative float is positioned against its ANCHOR
+        // PARAGRAPH: the body host emits position:relative for exactly this case
+        // (ParagraphAnchorsParagraphRelativeWrapNoneImage), so `top` is the raw
+        // posOffset below the paragraph's own top edge and `left` is measured
+        // from the paragraph's left edge. Word measures that horizontal offset
+        // from the text column, and the host box starts at the column origin plus
+        // its own left inset (the paragraph's indent, or the list gutter of the
+        // <li> a list item renders as), so the inset is subtracted to keep the
+        // painted x identical. Matched by paragraph identity so a float that is
+        // NOT hosted by the registered paragraph (nested text box, header band,
+        // table cell) stays on the page-relative path.
+        bool paragraphAnchored = _ctx.OverlayHostParagraph != null
+            && IsParagraphRelativeWrapNoneFloat(drawing)
+            && ReferenceEquals(drawing.Ancestors<Paragraph>().FirstOrDefault(), _ctx.OverlayHostParagraph);
+        // Both coordinates of a paragraph-anchored float are host-relative, so
+        // the page-margin baselines must not be folded in — the host already sits
+        // inside them. Header/footer bands are unaffected either way: their
+        // baselines are 0, and the host identity check never matches there.
+        double hostInsetPt = paragraphAnchored ? _ctx.OverlayHostInsetPt : 0;
+        if (paragraphAnchored) _ctx.EmittedParagraphAnchoredOverlay = true;
 
         var hPos = anchor.GetFirstChild<DW.HorizontalPosition>();
         var vPos = anchor.GetFirstChild<DW.VerticalPosition>();
@@ -520,13 +646,27 @@ public partial class WordHandler
                 : leftBase + hOffEmu / EmuConverter.EmuPerPointF;
         }
 
+        // The leftPt computed above is measured from the .page box. A
+        // paragraph-anchored float resolves against its host paragraph instead,
+        // whose left edge sits at leftBase + hostInsetPt, so both baselines come
+        // off to land on the same painted x.
+        if (paragraphAnchored) leftPt -= leftBase + hostInsetPt;
+
         double topPt = topBase;
         var vOffEl = vPos?.Descendants().FirstOrDefault(e => e.LocalName == "posOffset");
         if (vOffEl != null && long.TryParse(vOffEl.InnerText, out var vOffEmu))
         {
-            topPt = vFrom == DW.VerticalRelativePositionValues.Page
-                ? vOffEmu / EmuConverter.EmuPerPointF
-                : topBase + vOffEmu / EmuConverter.EmuPerPointF;
+            var vOffPt = vOffEmu / EmuConverter.EmuPerPointF;
+            // Page → absolute from the physical page edge. Paragraph/Line →
+            // the distance below the ANCHOR PARAGRAPH's own top edge, which the
+            // host paragraph now provides as the containing block, so the page
+            // top margin must NOT be added (it was, and every float landed near
+            // the top of its page instead of beside its own paragraph). Any
+            // other origin (margin/topMargin/bottomMargin/…) keeps the
+            // page-relative baseline.
+            topPt = paragraphAnchored || vFrom == DW.VerticalRelativePositionValues.Page
+                ? vOffPt
+                : topBase + vOffPt;
         }
 
         // behindDoc="1" → behind text (watermark); else in front.
@@ -548,7 +688,7 @@ public partial class WordHandler
 
         var crop = GetCropPercents(drawing);
         if (crop.HasValue)
-            RenderCroppedImage(sb, dataUri, widthPx, heightPx, crop.Value.l, crop.Value.t, crop.Value.r, crop.Value.b, HtmlEncodeAttr(alt), style);
+            RenderCroppedImage(sb, dataUri, widthPx, heightPx, crop.Value.l, crop.Value.t, crop.Value.r, crop.Value.b, HtmlEncodeAttr(alt), style, "span");
         else
             sb.Append($"<img src=\"{dataUri}\" alt=\"{HtmlEncodeAttr(alt)}\"{widthAttr}{heightAttr} style=\"{style}\">");
     }
@@ -672,8 +812,18 @@ public partial class WordHandler
     /// positioning ties the offset to the container box, not the line box, so every
     /// crop combination (symmetric / single-side / mixed) clips correctly.
     /// </summary>
+    /// <param name="containerTag">
+    /// Element wrapping the cropped window. Defaults to "div"; the wrapNone
+    /// overlay path passes "span" because the overflow:hidden window is emitted
+    /// INSIDE its anchor &lt;p&gt;, and the HTML parser closes an open &lt;p&gt; at a
+    /// block-level start tag — which would hoist the window (plus every following
+    /// sibling) out of the paragraph and lose the position:relative containing
+    /// block the overlay is measured against. A &lt;span&gt; carrying
+    /// display:inline-block lays out identically and stays in the paragraph.
+    /// </param>
     private static void RenderCroppedImage(StringBuilder sb, string dataUri, long displayWidthPx, long displayHeightPx,
-        double cropL, double cropT, double cropR, double cropB, string alt, string extraStyle = "")
+        double cropL, double cropT, double cropR, double cropB, string alt, string extraStyle = "",
+        string containerTag = "div")
     {
         // The display size is the cropped result size.
         // Original image visible fraction: (1 - cropL/100 - cropR/100) horizontally, (1 - cropT/100 - cropB/100) vertically.
@@ -690,9 +840,9 @@ public partial class WordHandler
 
         var containerStyle = $"position:relative;display:inline-block;width:{displayWidthPx}px;height:{displayHeightPx}px;overflow:hidden";
         if (!string.IsNullOrEmpty(extraStyle)) containerStyle += $";{extraStyle}";
-        sb.Append($"<div style=\"{containerStyle}\">");
+        sb.Append($"<{containerTag} style=\"{containerStyle}\">");
         sb.Append($"<img src=\"{dataUri}\" alt=\"{alt}\" style=\"position:absolute;left:{offsetX:0}px;top:{offsetY:0}px;width:{imgW:0}px;height:{imgH:0}px;max-width:none\">");
-        sb.Append("</div>");
+        sb.Append($"</{containerTag}>");
     }
 
     private static int GetIntAttr(OpenXmlElement el, string attrName)

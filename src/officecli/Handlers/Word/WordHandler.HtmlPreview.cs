@@ -41,6 +41,25 @@ public partial class WordHandler
         // null → fall back to MainDocumentPart (body path).
         public DocumentFormat.OpenXml.Packaging.OpenXmlPart? ImageHostPart { get; set; }
 
+        // The body host (<p>/<div>/<li>) currently being rendered, when it is
+        // the position:relative containing block for the paragraph-relative
+        // wrapNone floats it anchors, plus that host's left inset in points from
+        // the column origin (paragraph indent, or the list gutter of a list
+        // item). RenderWrapNoneOverlayImage matches the float's anchor paragraph
+        // against the host by identity, so a float rendered from a nested
+        // container never inherits an outer paragraph's inset.
+        public Paragraph? OverlayHostParagraph { get; set; }
+        public double OverlayHostInsetPt { get; set; }
+
+        // Set once the body has emitted a paragraph-anchored wrapNone overlay.
+        // Such a float can hang past the bottom of its .page, and .page is
+        // overflow-x:auto — the implied vertical scrollbar then narrows the text
+        // column by ~15px and re-wraps the body, which shifts pagination. The
+        // page divs carry overflow-y:clip when this is set (see the per-page
+        // emission), so only documents that actually have such a float are
+        // affected.
+        public bool EmittedParagraphAnchoredOverlay { get; set; }
+
         // Where image parts are written when the request asked for external assets
         // (--assets). null → every image inlines as a base64 data URI, as before.
         // Lives on the context rather than a parameter for the same reason
@@ -500,6 +519,17 @@ public partial class WordHandler
                 $"{activeLayout.MarginBottomPt.ToString("0.#", ci)}pt " +
                 $"{activeLayout.MarginLeftPt.ToString("0.#", ci)}pt;" +
                 pageBgCss;
+            // A paragraph-anchored wrapNone overlay is positioned against its
+            // anchor paragraph, so it can extend past the bottom (or the right
+            // edge) of the page it belongs to. .page is overflow-x:auto, whose
+            // implied overflow-y:auto would then add a vertical scrollbar — and
+            // that scrollbar (~15px) narrows the text column, re-wrapping the
+            // body and shifting where the paginator splits. Clip the page's
+            // vertical overflow instead so floats overhang the paper edge (which
+            // is where Word stops painting them) without reflowing the text. The
+            // horizontal axis keeps its scroll behaviour.
+            if (_ctx.EmittedParagraphAnchoredOverlay)
+                pageStyle += "overflow-y:clip;";
             // Page border (<w:pgBorders> in the active section's sectPr).
             // Real Word boxes the whole page; emit per-side border on the
             // .page div so partial (some-sides-only) borders also work.
@@ -2480,6 +2510,21 @@ public partial class WordHandler
         string? currentListType = null; // "bullet" or "ordered"
         int currentListLevel = 0;
         var listStack = new Stack<string>(); // track nested list tags
+        // The left padding each open <ol>/<ul> contributes, parallel to
+        // listStack. A paragraph-relative overlay inside a list item resolves
+        // against the <li> box, which starts that far right of the column
+        // origin, so ListGutterPt() feeds it to RenderWrapNoneOverlayImage as
+        // the host inset. CloseAllLists pops listStack without mirroring this,
+        // so the sum is reconciled against listStack.Count when read.
+        var listInsetStack = new Stack<double>();
+
+        double ListGutterPt()
+        {
+            while (listInsetStack.Count > listStack.Count) listInsetStack.Pop();
+            double gutterPt = 0;
+            foreach (var insetPt in listInsetStack) gutterPt += insetPt;
+            return gutterPt;
+        }
         int? currentNumId = null; // track numId for cross-numId nesting
         int prevOoxmlIlvl = 0; // previous list item's RAW (pre-offset) ilvl — nesting depth follows ilvl, not numId indent
         var numIdLevelOffset = new Dictionary<int, int>(); // numId → effective ilvl offset for cross-numId nesting
@@ -2953,6 +2998,7 @@ public partial class WordHandler
                     while (listStack.Count > ilvl + 1)
                     {
                         sb.AppendLine($"</{listStack.Pop()}>");
+                        listInsetStack.Pop();
                         sb.AppendLine("</li>");
                     }
                     if (pendingLiClose)
@@ -3042,13 +3088,16 @@ public partial class WordHandler
                         }
                         sb.AppendLine($"<{tag}{nestedStyle}>");
                         listStack.Push(tag);
+                        listInsetStack.Push(indentPt);
                     }
                     // If same level but different list type, swap
                     if (listStack.Count > 0 && listStack.Peek() != tag)
                     {
                         sb.AppendLine($"</{listStack.Pop()}>");
+                        listInsetStack.Pop();
                         sb.AppendLine($"<{tag}{indentStyle}>");
                         listStack.Push(tag);
+                        listInsetStack.Push(indentPt);
                     }
 
                     // Advance the ordered counter (increment level, reset
@@ -3144,12 +3193,19 @@ public partial class WordHandler
                         var hangCss = $"text-indent:calc(-{markerWidth} - {markerPadding})";
                         paraStyle = string.IsNullOrEmpty(paraStyle) ? hangCss : paraStyle + ";" + hangCss;
                     }
+                    // A list item that anchors a paragraph-relative wrapNone
+                    // float is that float's containing block: its <li> box (the
+                    // list gutter is the host inset, passed to the overlay path
+                    // so the column-relative hPosition still lands where Word
+                    // paints it).
+                    if (ParagraphAnchorsParagraphRelativeWrapNoneImage(para))
+                        paraStyle = string.IsNullOrEmpty(paraStyle) ? "position:relative" : paraStyle + ";position:relative";
                     if (!string.IsNullOrEmpty(paraStyle))
                         sb.Append($" style=\"{paraStyle}\"");
                     sb.Append(">");
                     if (olMarkerSpan != null)
                         sb.Append(olMarkerSpan);
-                    RenderParagraphContentHtml(sb, para);
+                    RenderParagraphContentAsFloatHost(sb, para, ListGutterPt());
                     pendingLiClose = true; // defer </li> in case next item nests
                     continue;
                 }
@@ -3309,7 +3365,7 @@ public partial class WordHandler
                         classNames.Add("has-aligned-tab");
                     if (classNames.Count > 0)
                         sb.Append($" class=\"{string.Join(" ", classNames)}\"");
-                    var pStyle = GetParagraphInlineCss(para);
+                    var pStyle = GetParagraphInlineCss(para, false, out var hostInsetPt);
                     // A body paragraph that anchors a wrapNone shape positioned
                     // relative to the column/paragraph (see
                     // ComputeParagraphAnchorAbsoluteCss) is the position:relative
@@ -3317,7 +3373,13 @@ public partial class WordHandler
                     // mirrors BuildParagraphOpenTag (header/footer path) and the
                     // table-cell <td> path. Without it the shapes resolve against
                     // the .page box and lose their per-shape posOffset.
-                    if (ParagraphAnchorsSubParagraphShape(para))
+                    //
+                    // A paragraph-relative wrapNone IMAGE needs the same
+                    // containing block for its own reason: its `top` is the raw
+                    // vPosition posOffset (see RenderWrapNoneOverlayImage), which
+                    // only means "below this paragraph" against the paragraph box.
+                    if (ParagraphAnchorsSubParagraphShape(para)
+                        || ParagraphAnchorsParagraphRelativeWrapNoneImage(para))
                         pStyle = string.IsNullOrEmpty(pStyle) ? "position:relative" : pStyle + ";position:relative";
                     if (!string.IsNullOrEmpty(pStyle))
                         sb.Append($" style=\"{pStyle}\"");
@@ -3328,7 +3390,7 @@ public partial class WordHandler
                     // emits nothing collapses the line box in the browser, so
                     // a placeholder &nbsp; is needed to preserve line-height.
                     var lenBefore = sb.Length;
-                    RenderParagraphContentHtml(sb, para);
+                    RenderParagraphContentAsFloatHost(sb, para, hostInsetPt);
                     if (sb.Length == lenBefore) sb.Append("&nbsp;");
                     sb.Append("</").Append(pTag).AppendLine(">");
                     AppendW14ReflectionBlock(sb, para, pTag, pStyle);

@@ -334,7 +334,21 @@ public partial class WordHandler
     }
 
     private string GetParagraphInlineCss(Paragraph para, bool isListItem = false)
+        => GetParagraphInlineCss(para, isListItem, out _);
+
+    /// <summary>
+    /// Same as the two-argument overload, additionally reporting the paragraph's
+    /// effective left indent in points — the value emitted as
+    /// <c>margin-left</c>. A paragraph-relative overlay inside this paragraph
+    /// resolves against the paragraph's own box, which starts exactly this far
+    /// right of the column origin, so RenderWrapNoneOverlayImage subtracts it to
+    /// keep Word's column-relative horizontal offset (see
+    /// ParagraphAnchorsParagraphRelativeWrapNoneImage). List items report 0: their
+    /// indent lives on the enclosing &lt;ol&gt;/&lt;ul&gt; padding instead.
+    /// </summary>
+    private string GetParagraphInlineCss(Paragraph para, bool isListItem, out double leftIndentPt)
     {
+        leftIndentPt = 0;
         var parts = new List<string>();
 
         // Set paragraph font-size and font-family to match the first run.
@@ -478,7 +492,10 @@ public partial class WordHandler
             // margin so subsequent lines visibly indent.
             if (hangPt.HasValue && leftPt == 0) leftPt = hangPt.Value;
             if (leftPt != 0)
+            {
                 parts.Add($"margin-left:{leftPt:0.##}pt");
+                leftIndentPt = leftPt;
+            }
             if (indRight is string rightTwips && rightTwips != "0")
                 parts.Add($"margin-right:{Units.TwipsToPt(rightTwips):0.##}pt");
             else if (indRightChars is int rightChars && rightChars != 0)
